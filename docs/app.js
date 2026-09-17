@@ -58,6 +58,7 @@
       let busy = false;
       let pollTimer = 0;
       let lastJson = "";
+      const photoCache = {};
 
       let boardError = "";
 
@@ -85,6 +86,34 @@
           localStorage.setItem(SESSION_KEY, data.sessionId);
         }
         lastJson = JSON.stringify({ users: state.users, visits: state.visits });
+      }
+
+      async function loadPhoto(img) {
+        const id = img.getAttribute("data-photo-id");
+        if (!id) return;
+        if (photoCache[id]) {
+          img.src = photoCache[id];
+          return;
+        }
+        try {
+          let data = null;
+          for (const path of API_PATHS) {
+            const res = await fetch(`${path}?photo=${encodeURIComponent(id)}`, { cache: "no-store" });
+            const text = await res.text();
+            try {
+              data = JSON.parse(text);
+              break;
+            } catch {
+              data = null;
+            }
+          }
+          if (data && data.photo) {
+            photoCache[id] = data.photo;
+            img.src = data.photo;
+          }
+        } catch {
+          /* photo is optional */
+        }
       }
 
       async function api(method, payload) {
@@ -327,7 +356,11 @@
                      </div>`;
                 const extra = v.yes.length ? ` · ${v.yes.length}/2` : "";
                 const proof = (v.note ? `<p class="note">${escapeHtml(v.note)}</p>` : "") +
-                  (v.photo ? `<img class="shot" alt="" src="${v.photo}">` : "");
+                  (v.photo && String(v.photo).indexOf("data:image/") === 0
+                    ? `<img class="shot" alt="" src="${v.photo}">`
+                    : v.hasPhoto || v.photo
+                      ? `<img class="shot" alt="" data-photo-id="${escapeHtml(v.id)}">`
+                      : "");
                 return `<li class="item">
                   <div class="grow">
                     <p class="name">${escapeHtml(v.name)}</p>
@@ -479,6 +512,9 @@
         root.querySelectorAll("[data-vote]").forEach((n) =>
           n.addEventListener("click", () => vote(n.getAttribute("data-vote"), n.getAttribute("data-choice"))),
         );
+        root.querySelectorAll("img[data-photo-id]").forEach((img) => {
+          void loadPhoto(img);
+        });
       }
 
       render();

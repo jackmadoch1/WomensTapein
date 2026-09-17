@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 const TZ = "America/Chicago";
-const MAX_VISITS = 400;
+const MAX_VISITS = 120;
 const MAX_PHOTO = 350_000;
 const STORE = "site:atr-tracker";
 const KEY = "state";
@@ -32,10 +32,37 @@ function weekStartMonday(d = new Date()) {
   return utc.toISOString().slice(0, 10);
 }
 
+function pruneBefore() {
+  const start = weekStartMonday();
+  const [y, m, d] = start.split("-").map(Number);
+  const utc = new Date(Date.UTC(y, m - 1, d, 12));
+  utc.setUTCDate(utc.getUTCDate() - 14);
+  return utc.toISOString().slice(0, 10);
+}
+
+function hasPhoto(visit) {
+  return Boolean(visit?.hasPhoto || (visit?.photo && String(visit.photo).startsWith("data:image/")));
+}
+
 function publicState(state) {
+  const week = weekStartMonday();
   return {
     users: (state.users || []).map((u) => ({ id: u.id, name: u.name })),
-    visits: state.visits || [],
+    visits: (state.visits || [])
+      .filter((v) => v.weekStart === week)
+      .map((v) => ({
+        id: v.id,
+        userId: v.userId,
+        name: v.name,
+        note: v.note || "",
+        hasPhoto: hasPhoto(v),
+        photo: null,
+        createdAt: v.createdAt,
+        weekStart: v.weekStart,
+        yes: Array.isArray(v.yes) ? v.yes : [],
+        no: Array.isArray(v.no) ? v.no : [],
+        status: v.status === "approved" ? "approved" : "pending",
+      })),
   };
 }
 
@@ -55,13 +82,30 @@ function blobUrl(ctx, key) {
   return new URL(`${ctx.siteID}/${STORE}/${key}`, base).toString();
 }
 
-async function load(ctx) {
-  const res = await fetch(blobUrl(ctx, KEY), {
+async function readJson(ctx, key) {
+  const res = await fetch(blobUrl(ctx, key), {
     headers: { authorization: `Bearer ${ctx.token}` },
   });
-  if (res.status === 404) return { users: [], visits: [] };
+  if (res.status === 404) return null;
   if (!res.ok) throw new Error(`Could not read board (${res.status}).`);
-  const data = await res.json();
+  return res.json();
+}
+
+async function writeJson(ctx, key, value) {
+  const res = await fetch(blobUrl(ctx, key), {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${ctx.token}`,
+      "content-type": "application/json",
+      "cache-control": "max-age=0, stale-while-revalidate=60",
+    },
+    body: JSON.stringify(value),
+  });
+  if (!res.ok) throw new Error(`Could not save board (${res.status}).`);
+}
+
+async function load(ctx) {
+  const data = await readJson(ctx, KEY);
   if (!data || typeof data !== "object") return { users: [], visits: [] };
   return {
     users: Array.isArray(data.users) ? data.users : [],
@@ -69,17 +113,28 @@ async function load(ctx) {
   };
 }
 
+async function extractPhotos(ctx, state) {
+  const cutoff = pruneBefore();
+  const visits = [];
+  for (const v of state.visits || []) {
+    if (v.weekStart && v.weekStart < cutoff) continue;
+    if (v.photo && String(v.photo).startsWith("data:image/")) {
+      try {
+        await writeJson(ctx, `photo-${v.id}`, { photo: v.photo });
+        v.hasPhoto = true;
+      } catch {
+        v.hasPhoto = true;
+      }
+      v.photo = null;
+    }
+    visits.push(v);
+  }
+  state.visits = visits.slice(0, MAX_VISITS);
+  return state;
+}
+
 async function save(ctx, state) {
-  const res = await fetch(blobUrl(ctx, KEY), {
-    method: "PUT",
-    headers: {
-      authorization: `Bearer ${ctx.token}`,
-      "content-type": "application/json",
-      "cache-control": "max-age=0, stale-while-revalidate=60",
-    },
-    body: JSON.stringify(state),
-  });
-  if (!res.ok) throw new Error(`Could not save board (${res.status}).`);
+  await writeJson(ctx, KEY, await extractPhotos(ctx, state));
 }
 
 function applyOp(state, body) {
@@ -90,11 +145,11 @@ function applyOp(state, body) {
     if (name.length < 2) return { error: "Enter your name." };
     if (password.length < 4) return { error: "Password must be at least 4 characters." };
     if (state.users.some((u) => u.name.toLowerCase() === name.toLowerCase())) {
-      return { error: "That name is already taken." };
+      return { error: "That name is already taken. Sign in instead." };
     }
     const user = { id: uid(), name, passwordHash: hashPassword(password) };
     state.users.push(user);
-    return { state, sessionId: user.id };
+    return { state, sessionId: user.id, mutated: true };
   }
   if (op === "signin") {
     const name = String(body.name || "").trim();
@@ -103,7 +158,7 @@ function applyOp(state, body) {
     if (!user || user.passwordHash !== hashPassword(password)) {
       return { error: "Name or password is wrong." };
     }
-    return { state, sessionId: user.id };
+    return { state, sessionId: user.id, mutated: false };
   }
   if (op === "checkin") {
     const user = state.users.find((u) => u.id === body.userId);
@@ -113,20 +168,21 @@ function applyOp(state, body) {
     if (photo && (photo.length > MAX_PHOTO || !photo.startsWith("data:image/"))) {
       return { error: "That photo is too large or not supported." };
     }
-    state.visits.unshift({
+    const visit = {
       id: uid(),
       userId: user.id,
       name: user.name,
       note,
       photo: photo || null,
+      hasPhoto: Boolean(photo),
       createdAt: new Date().toISOString(),
       weekStart: weekStartMonday(),
       yes: [],
       no: [],
       status: "pending",
-    });
-    if (state.visits.length > MAX_VISITS) state.visits.length = MAX_VISITS;
-    return { state, sessionId: user.id };
+    };
+    state.visits.unshift(visit);
+    return { state, sessionId: user.id, mutated: true };
   }
   if (op === "vote") {
     const user = state.users.find((u) => u.id === body.userId);
@@ -141,7 +197,7 @@ function applyOp(state, body) {
     }
     visit[choice].push(user.id);
     if (visit.yes.length >= 2) visit.status = "approved";
-    return { state, sessionId: user.id, approved: visit.status === "approved", yesCount: visit.yes.length, choice };
+    return { state, sessionId: user.id, mutated: true, approved: visit.status === "approved", yesCount: visit.yes.length, choice };
   }
   return { error: "Unknown action." };
 }
@@ -158,20 +214,41 @@ function json(statusCode, body) {
   return { statusCode, headers: cors, body: JSON.stringify(body) };
 }
 
+function query(event) {
+  return event.queryStringParameters || {};
+}
+
 export async function handler(event) {
   if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: cors };
   try {
     const ctx = blobsContext(event);
+    const photoId = query(event).photo;
+    if (event.httpMethod === "GET" && photoId) {
+      const stored = await readJson(ctx, `photo-${photoId}`);
+      if (stored?.photo) return json(200, { photo: stored.photo });
+      const state = await load(ctx);
+      const visit = state.visits.find((v) => v.id === photoId);
+      return json(200, { photo: visit?.photo || null });
+    }
     if (event.httpMethod === "GET") {
       const state = await load(ctx);
       return json(200, publicState(state));
     }
     if (event.httpMethod !== "POST") return json(405, { error: "Method not allowed." });
-    const body = JSON.parse(event.body || "{}");
+    const raw = event.isBase64Encoded
+      ? Buffer.from(event.body || "", "base64").toString("utf8")
+      : event.body || "{}";
+    const body = JSON.parse(raw);
     const state = await load(ctx);
     const result = applyOp(state, body);
     if (result.error) return json(400, { error: result.error });
-    await save(ctx, result.state);
+    if (result.mutated) {
+      try {
+        await save(ctx, result.state);
+      } catch (err) {
+        if (body.op === "signup" || body.op === "checkin") throw err;
+      }
+    }
     return json(200, {
       ...publicState(result.state),
       sessionId: result.sessionId || null,
